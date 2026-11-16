@@ -1,8 +1,15 @@
+import hmac
+import io
 import os
+import tarfile
+import threading
 import time
 import uuid
+import zipfile
+from datetime import datetime, timezone
 
 import chromadb
+import requests
 import streamlit as st
 from google import genai
 from google.genai import types
@@ -14,6 +21,11 @@ from pypdf import PdfReader
 # Fallback list, used only if the live model list cannot be fetched
 CHAT_MODELS = ["gemini-3.8-flash"]
 EMBED_MODEL = "gemini-embedding-001"
+
+# Agent mode (Antigravity managed agent). Preview agent names change; check
+# https://ai.google.dev/gemini-api/docs/managed-agents-quickstart
+AGENT_ID = "antigravity-preview-09-2026"
+AGENT_DAILY_LIMIT = 20  # app-wide cap per day, to protect your free quota
 
 PERSONAS = {
     "Helpful assistant": "You are a helpful, concise assistant.",
@@ -36,6 +48,13 @@ except Exception:
 if not api_key:
     st.error("Add GEMINI_API_KEY to your Streamlit secrets (or environment).")
     st.stop()
+
+
+def get_secret(name):
+    try:
+        return st.secrets[name]
+    except Exception:
+        return os.environ.get(name)
 
 
 @st.cache_resource
@@ -70,6 +89,14 @@ if "msgs" not in st.session_state:
     st.session_state.msgs = []
 if "indexed" not in st.session_state:
     st.session_state.indexed = set()
+for _k, _v in {
+    "agent_ok": False,     # password entered correctly
+    "agent_prev": None,    # id of the last agent interaction (for follow-ups)
+    "agent_env": None,     # id of the agent's sandbox environment
+    "agent_files": None,   # files downloaded from the sandbox
+}.items():
+    if _k not in st.session_state:
+        st.session_state[_k] = _v
 if "chroma" not in st.session_state:
     st.session_state.chroma = chromadb.Client()
     st.session_state.collection = st.session_state.chroma.create_collection(
@@ -117,6 +144,111 @@ def retrieve(question, k=4):
     return res["documents"][0], res["metadatas"][0]
 
 
+# ---------- Agent mode helpers ----------
+@st.cache_resource
+def _agent_state():
+    return {"day": None, "n": 0, "lock": threading.Lock()}
+
+
+def _today_pacific():
+    # Google's daily quota resets at midnight Pacific time
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo("America/Los_Angeles")).date().isoformat()
+    except Exception:
+        return datetime.now(timezone.utc).date().isoformat()
+
+
+def agent_runs_today():
+    state = _agent_state()
+    with state["lock"]:
+        if state["day"] != _today_pacific():
+            state["day"], state["n"] = _today_pacific(), 0
+        return state["n"]
+
+
+def agent_try_use():
+    """Count one agent run. Returns False if today's cap is reached."""
+    state = _agent_state()
+    with state["lock"]:
+        if state["day"] != _today_pacific():
+            state["day"], state["n"] = _today_pacific(), 0
+        if state["n"] >= AGENT_DAILY_LIMIT:
+            return False
+        state["n"] += 1
+        return True
+
+
+def run_agent(text, instruction):
+    if not hasattr(client, "interactions"):
+        raise RuntimeError(
+            "This google-genai version has no Interactions API. "
+            "Set google-genai>=2.3.0 in requirements.txt."
+        )
+    kwargs = {"agent": AGENT_ID, "input": text}
+    if st.session_state.agent_prev and st.session_state.agent_env:
+        # follow-up: continue the same conversation and sandbox
+        kwargs["previous_interaction_id"] = st.session_state.agent_prev
+        kwargs["environment"] = st.session_state.agent_env
+    else:
+        kwargs["environment"] = "remote"  # fresh sandbox
+        if instruction:
+            kwargs["system_instruction"] = instruction
+    interaction = client.interactions.create(**kwargs)
+    st.session_state.agent_prev = interaction.id
+    st.session_state.agent_env = interaction.environment_id
+    return interaction
+
+
+def show_steps(interaction):
+    steps = getattr(interaction, "steps", None) or []
+    if steps:
+        with st.expander(f"Agent steps ({len(steps)})"):
+            for i, step in enumerate(steps, 1):
+                kind = getattr(step, "type", None) or type(step).__name__
+                st.caption(f"{i}. {kind}")
+
+
+def fetch_workspace(env_id):
+    r = requests.get(
+        f"https://generativelanguage.googleapis.com/v1beta/files/environment-{env_id}:download",
+        params={"alt": "media"},
+        headers={"x-goog-api-key": api_key},
+        timeout=60,
+    )
+    r.raise_for_status()
+    return r.content
+
+
+def archive_kind(data):
+    if data[:2] == b"PK":
+        return ".zip", "application/zip"
+    if data[:2] == b"\x1f\x8b":
+        return ".tar.gz", "application/gzip"
+    if data[257:262] == b"ustar":
+        return ".tar", "application/x-tar"
+    return ".bin", "application/octet-stream"
+
+
+def extract_images(data):
+    exts = (".png", ".jpg", ".jpeg", ".webp", ".gif")
+    imgs = []
+    try:
+        if data[:2] == b"PK":
+            with zipfile.ZipFile(io.BytesIO(data)) as z:
+                for name in z.namelist():
+                    if name.lower().endswith(exts) and z.getinfo(name).file_size < 5_000_000:
+                        imgs.append((name, z.read(name)))
+        else:
+            with tarfile.open(fileobj=io.BytesIO(data), mode="r:*") as t:
+                for mem in t.getmembers():
+                    if mem.isfile() and mem.name.lower().endswith(exts) and mem.size < 5_000_000:
+                        imgs.append((mem.name, t.extractfile(mem).read()))
+    except Exception:
+        pass
+    return imgs[:8]
+
+
 # ---------- Sidebar ----------
 with st.sidebar:
     st.header("Settings")
@@ -159,8 +291,45 @@ with st.sidebar:
         st.caption("Indexed: " + ", ".join(sorted(st.session_state.indexed)))
 
     st.divider()
+    st.header("Agent mode")
+    agent_mode = st.toggle(
+        "Use Antigravity agent",
+        help="Runs code in a Google sandbox. Password protected to save quota.",
+    )
+    agent_active = False
+    if agent_mode:
+        agent_pw = get_secret("AGENT_PASSWORD")
+        if not agent_pw:
+            st.warning("Agent mode is locked. Add AGENT_PASSWORD to the app secrets.")
+        elif st.session_state.agent_ok:
+            agent_active = True
+        else:
+            entered = st.text_input("Agent password", type="password")
+            if entered and hmac.compare_digest(entered.encode(), str(agent_pw).encode()):
+                st.session_state.agent_ok = True
+                st.rerun()
+            elif entered:
+                st.error("Wrong password.")
+    if agent_active:
+        st.caption(f"Agent runs today: {agent_runs_today()} / {AGENT_DAILY_LIMIT}")
+        st.caption("Images and PDFs are ignored in agent mode.")
+        if st.session_state.agent_env and st.button("Load agent files"):
+            try:
+                with st.spinner("Fetching files from the agent workspace..."):
+                    data = fetch_workspace(st.session_state.agent_env)
+                st.session_state.agent_files = {
+                    "data": data,
+                    "images": extract_images(data),
+                }
+            except Exception as e:
+                st.error(f"Could not fetch files: {e}")
+
+    st.divider()
     if st.button("Clear chat"):
         st.session_state.msgs = []
+        st.session_state.agent_prev = None
+        st.session_state.agent_env = None
+        st.session_state.agent_files = None
         st.rerun()
     if st.button("Clear documents"):
         st.session_state.chroma.delete_collection(st.session_state.collection.name)
@@ -181,6 +350,19 @@ for m in st.session_state.msgs:
                 for s in m["sources"]:
                     st.caption(s)
 
+if st.session_state.agent_files:
+    with st.expander("📁 Agent files", expanded=True):
+        files_data = st.session_state.agent_files["data"]
+        for name, img in st.session_state.agent_files["images"]:
+            st.image(img, caption=name)
+        ext, mime = archive_kind(files_data)
+        st.download_button(
+            "Download all agent files",
+            files_data,
+            file_name=f"agent_workspace{ext}",
+            mime=mime,
+        )
+
 # ---------- New message ----------
 if prompt := st.chat_input("Ask me anything (or about your PDFs)"):
     image_bytes = image_file.getvalue() if image_file else None
@@ -192,6 +374,35 @@ if prompt := st.chat_input("Ask me anything (or about your PDFs)"):
         if image_bytes:
             st.image(image_bytes, width=250)
         st.write(prompt)
+
+    if agent_active:
+        with st.chat_message("assistant"):
+            if image_bytes:
+                st.info("Agent mode ignores attached images.")
+            if not agent_try_use():
+                reply = (
+                    f"Agent mode reached today's limit of {AGENT_DAILY_LIMIT} runs. "
+                    "Turn it off to keep chatting normally, or try again tomorrow."
+                )
+                st.warning(reply)
+            else:
+                try:
+                    with st.spinner("Agent is working... this can take a minute or two."):
+                        interaction = run_agent(prompt, system_prompt)
+                    reply = interaction.output_text or "(The agent returned no text.)"
+                    st.write(reply)
+                    show_steps(interaction)
+                    st.caption("If the agent made files, click Load agent files in the sidebar.")
+                except Exception as e:
+                    reply = (
+                        f"Agent error: {e}\n\n503 means Google is busy, 429 means a "
+                        "quota limit. Wait a bit and try again."
+                    )
+                    st.error(reply)
+        st.session_state.msgs.append(
+            {"role": "assistant", "content": reply, "sources": []}
+        )
+        st.stop()
 
     docs, metas = [], []
     if not image_bytes:  # document search is skipped when an image is attached
