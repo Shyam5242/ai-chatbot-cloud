@@ -11,7 +11,7 @@ from pypdf import PdfReader
 # Model names change over time. If you get a "model not found" error, check
 # https://ai.google.dev/gemini-api/docs/models and edit these.
 # Fallback list, used only if the live model list cannot be fetched
-CHAT_MODELS = ["gemini-2.5-flash", "gemini-2.5-flash-lite"]
+CHAT_MODELS = ["gemini-3.8-flash"]
 EMBED_MODEL = "gemini-embedding-001"
 
 PERSONAS = {
@@ -120,7 +120,10 @@ def retrieve(question, k=4):
 with st.sidebar:
     st.header("Settings")
     available = list_chat_models(client)
-    default = available.index("gemini-2.5-flash") if "gemini-2.5-flash" in available else 0
+    full = [m for m in available if "lite" not in m]
+    default = available.index("gemini-3.8-flash") if "gemini-3.8-flash" in available else (
+        available.index(full[-1]) if full else 0
+    )
     model = st.selectbox("Model", available, index=default)
     persona = st.selectbox("Personality", list(PERSONAS))
     if persona == "Custom":
