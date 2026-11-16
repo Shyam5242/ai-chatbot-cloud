@@ -16,6 +16,7 @@ A free, deployable AI chatbot built with Streamlit and the Gemini API, with PDF 
 - **Document Q&A (RAG)**: upload PDFs and ask questions; answers come from your documents, with a Sources dropdown (ChromaDB + Gemini embeddings)
 - **Image chat**: attach an image and ask questions about it
 - **Creativity slider** to control the temperature
+- **Agent mode (optional, password protected)**: hands your request to Google's Antigravity agent, which can write and run code in a sandbox, make charts, and create files you can download
 - Friendly error messages for rate limits and missing keys
 
 ## Tech stack
@@ -48,6 +49,17 @@ Python, Streamlit, Google Gemini API (`google-genai`), ChromaDB, pypdf
    GEMINI_API_KEY = "your-key-here"
    ```
 5. Click **Deploy**.
+
+## Agent mode
+
+Agent mode uses Google's Antigravity managed agent through the Interactions API.
+
+- Turn on **Use Antigravity agent** in the sidebar and enter the agent password.
+- Add `AGENT_PASSWORD = "choose-a-password"` to your Streamlit secrets. Without it, Agent mode stays locked, so visitors to a public link can't use up your quota.
+- The app caps agent runs per day (`AGENT_DAILY_LIMIT` in `app.py`) to stay inside the free tier.
+- Follow-up messages continue the same task and sandbox. Click **Load agent files** in the sidebar to see charts and download everything the agent created.
+- Agent mode ignores attached images and PDFs.
+- Requires `google-genai` 2.3.0 or later. The agent name (`AGENT_ID` in `app.py`) is a preview and may change, so check Google's docs if it stops working.
 
 ## How it works
 
