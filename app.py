@@ -121,10 +121,9 @@ def retrieve(question, k=4):
 with st.sidebar:
     st.header("Settings")
     available = list_chat_models(client)
-    full = [m for m in available if "lite" not in m]
-    default = available.index("gemini-3.8-flash") if "gemini-3.8-flash" in available else (
-        available.index(full[-1]) if full else 0
-    )
+    # Lite models have higher free-tier limits, so make the newest one the default
+    lite = [m for m in available if "lite" in m]
+    default = available.index(lite[-1]) if lite else 0
     model = st.selectbox("Model", available, index=default)
     persona = st.selectbox("Personality", list(PERSONAS))
     if persona == "Custom":
@@ -229,10 +228,13 @@ if prompt := st.chat_input("Ask me anything (or about your PDFs)"):
     def is_gone(e):
         return "404" in str(e) or "NOT_FOUND" in str(e)
 
+    def is_limit(e):
+        return "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e)
+
     def stream():
         # Try the chosen model first. If Google says it is busy (503), retry
         # once, then fall back to the next available model automatically.
-        candidates = ([model] + [m for m in available if m != model])[:3]
+        candidates = ([model] + [m for m in reversed(available) if m != model])[:4]
         last_err = None
         for cand in candidates:
             for attempt in range(2):
@@ -251,11 +253,11 @@ if prompt := st.chat_input("Ask me anything (or about your PDFs)"):
                             yield chunk.text
                     return
                 except Exception as e:
-                    if started or not (is_busy(e) or is_gone(e)):
+                    if started or not (is_busy(e) or is_gone(e) or is_limit(e)):
                         raise
                     last_err = e
-                    if is_gone(e):
-                        break  # model not usable, go to the next one
+                    if is_gone(e) or is_limit(e):
+                        break  # unusable or out of quota: try the next model
                     time.sleep(2)  # busy: wait briefly, then retry
         raise last_err
 
