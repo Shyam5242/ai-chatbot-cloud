@@ -10,7 +10,8 @@ from pypdf import PdfReader
 # ---------- Config ----------
 # Model names change over time. If you get a "model not found" error, check
 # https://ai.google.dev/gemini-api/docs/models and edit these.
-CHAT_MODELS = ["gemini-flash-latest", "gemini-flash-lite-latest"]
+# Fallback list, used only if the live model list cannot be fetched
+CHAT_MODELS = ["gemini-2.5-flash", "gemini-2.5-flash-lite"]
 EMBED_MODEL = "gemini-embedding-001"
 
 PERSONAS = {
@@ -42,6 +43,26 @@ def get_client(key):
 
 
 client = get_client(api_key)
+
+
+@st.cache_data(ttl=3600)
+def list_chat_models(_client):
+    """Ask the API which Gemini chat models this key can use right now."""
+    try:
+        skip = ("image", "tts", "live", "audio", "embedding", "robotics", "computer")
+        names = []
+        for m in _client.models.list():
+            n = m.name.replace("models/", "")
+            if (
+                "generateContent" in (m.supported_actions or [])
+                and n.startswith("gemini")
+                and "flash" in n
+                and not any(x in n for x in skip)
+            ):
+                names.append(n)
+        return sorted(set(names)) or CHAT_MODELS
+    except Exception:
+        return CHAT_MODELS
 
 # ---------- Session state ----------
 if "msgs" not in st.session_state:
@@ -98,7 +119,9 @@ def retrieve(question, k=4):
 # ---------- Sidebar ----------
 with st.sidebar:
     st.header("Settings")
-    model = st.selectbox("Model", CHAT_MODELS)
+    available = list_chat_models(client)
+    default = available.index("gemini-2.5-flash") if "gemini-2.5-flash" in available else 0
+    model = st.selectbox("Model", available, index=default)
     persona = st.selectbox("Personality", list(PERSONAS))
     if persona == "Custom":
         system_prompt = st.text_area(
