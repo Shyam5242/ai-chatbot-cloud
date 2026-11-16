@@ -1,4 +1,5 @@
 import os
+import time
 import uuid
 
 import chromadb
@@ -222,24 +223,50 @@ if prompt := st.chat_input("Ask me anything (or about your PDFs)"):
         last_parts.append(types.Part.from_bytes(data=image_bytes, mime_type=image_mime))
     contents.append(types.Content(role="user", parts=last_parts))
 
+    def is_busy(e):
+        return "503" in str(e) or "UNAVAILABLE" in str(e)
+
+    def is_gone(e):
+        return "404" in str(e) or "NOT_FOUND" in str(e)
+
     def stream():
-        for chunk in client.models.generate_content_stream(
-            model=model,
-            contents=contents,
-            config=types.GenerateContentConfig(
-                system_instruction=system_prompt, temperature=temperature
-            ),
-        ):
-            if chunk.text:
-                yield chunk.text
+        # Try the chosen model first. If Google says it is busy (503), retry
+        # once, then fall back to the next available model automatically.
+        candidates = ([model] + [m for m in available if m != model])[:3]
+        last_err = None
+        for cand in candidates:
+            for attempt in range(2):
+                started = False
+                try:
+                    for chunk in client.models.generate_content_stream(
+                        model=cand,
+                        contents=contents,
+                        config=types.GenerateContentConfig(
+                            system_instruction=system_prompt,
+                            temperature=temperature,
+                        ),
+                    ):
+                        if chunk.text:
+                            started = True
+                            yield chunk.text
+                    return
+                except Exception as e:
+                    if started or not (is_busy(e) or is_gone(e)):
+                        raise
+                    last_err = e
+                    if is_gone(e):
+                        break  # model not usable, go to the next one
+                    time.sleep(2)  # busy: wait briefly, then retry
+        raise last_err
 
     with st.chat_message("assistant"):
         try:
             reply = st.write_stream(stream())
         except Exception as e:
             reply = (
-                f"Something went wrong: {e}\n\nIf this says 429 or quota, "
-                "you've hit the free-tier limit. Wait a bit and try again."
+                f"Something went wrong: {e}\n\n503 means Google is busy, so try "
+                "again in a minute. 429 or quota means you've hit the "
+                "free-tier limit, so wait a bit."
             )
             st.error(reply)
 
